@@ -57,7 +57,7 @@ A voxel isn't a cube: patient 31 is 0.91 × 0.91 × **0.7** mm, patient 6 is 0.7
 ### 3.3 "Connected": 6 vs 26 neighbours
 Two voxels can count as touching if they share a **face** (`S6`) or even just a **corner** (`S26`). That difference was the reason for the specks:
 
-<p align="center"><img src="/Users/robbannn/Desktop/PROJECTS/BODY_WARMUP_KHUBAIB/Images/doc_figures/specks_explained.png" width="850"></p>
+<p align="center"><img src="Images/doc_figures/specks_explained.png" width="850"></p>
 
 A 3D viewer only joins faces, so a corner-only join *looks* separate. Code that counts corners calls those blobs "connected" and never cleans them. Step 3 fixes that.
 
