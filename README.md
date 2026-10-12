@@ -322,12 +322,10 @@ Switches: `--no_specks` (old behaviour), `--no_hao_check` (skip the second pipel
 
 ---
 
-## 8. Known limits (being honest)
+## 8. Known limits 
 
 - **C1 on patient 6** is still in 2 pieces. One is 243 mm³, above the 150 mm³ limit, so I left it on purpose since it could be real bone.
-- **Unusual anatomy** (11 or 13 rib pairs, transitional vertebrae) can fool the name check. That's why it only reports.
-- **Needs real CT values** (Hounsfield units). A converted 0–255 image won't work.
-- **Needs `cc3d`** (`pip install connected-components-3d`). Pro relies on it, and I tested that scipy can't replace it without changing Pro's results.
+- **Unusual anatomy** (11 or 13 rib pairs, transitional vertebrae) can fool the name check. That's why it only reports. There are biological exceptions in this ribs idea , some people might not fall into the rib idea due to their unusual anatomy.
 - **Memory:** peaks around 8 GB on a long scan.
 - **Viewing tip:** when checking results in ITK-SNAP, especially on thick-slice scans, turn **3D Gaussian smoothing off**. It can make thin, real bone (like spinous tips) look like loose specks.
 
@@ -335,7 +333,7 @@ Switches: `--no_specks` (old behaviour), `--no_hao_check` (skip the second pipel
 
 ## 9. Scoring system: measuring instead of eyeballing
 
-I made an **ideal mask** (`Final02/`, for patients 6 and 31) that I treat as the "right answer". I then built a scoring script, `direct_inference/score_vertebrae.py`, that compares **any** prediction folder against it, vertebra by vertebra.
+I made an **ideal mask** (of my final answer ( iam currently doing ideal segmentation by hand, but for now my final answer is treated as right) for patients 6 and 31) that I treat as the "right answer". I then built a scoring script, `direct_inference/score_vertebrae.py`, that compares **any** prediction folder against it, vertebra by vertebra.
 
 ```bash
 python score_vertebrae.py --ideal ../Final02 \
@@ -380,7 +378,7 @@ I sanity-checked it on synthetic masks:
 | AbdomenAtlasDemoRefined1 | 72.0 | 0.876 | T7 0.69 | 8.5 | 1.00 | 0.04 |
 | Hao | 78.6 | 0.919 | T8 0.80 | 6.0 | 1.00 | 0.17 |
 | Pro | 92.1 | 0.990 | C7 0.97 | 0.4 | 1.00 | 0.33 |
-| Final1 | 92.7 | 0.996 | C7 0.98 | 0.03 | 1.00 | 0.29 |
+
 
 Patient 6: the raw AI scores **88.0** (mean Dice 0.946, but only 42 % of vertebrae clean).
 
@@ -389,7 +387,7 @@ Patient 6: the raw AI scores **88.0** (mean Dice 0.946, but only 42 % of vertebr
 - **Pro's shapes are already very close (Dice 0.99), but only 33 % of its vertebrae are clean.** The specks are what's left, and that's the part I fixed.
 - **Hao edits only L2–T5**, so everything else keeps the AI's mistakes.
 
-**Honest caveat:** `Final02` is currently **identical to my pipeline's output** (`Final/`). So my own result scores 100 by definition, and that number proves nothing about my method. Right now the scores tell how close *other* methods get to mine. To make it a real benchmark, the next step is to **hand-correct `Final02`** in ITK-SNAP wherever I disagree with my pipeline (for example the C6/C5 spot, or the C1 piece). Every method, including mine, then gets scored against a truly independent answer. More cases would help too: AbdomenAtlas, or TotalSegmentator/VerSe, which come with expert vertebra labels.
+**Honest caveat:** My final answer is currently **identical to my pipeline's output** (`Final/`). So my own result scores 100 by definition, and that number proves nothing about my method. Right now the scores tell how close *other* methods get to mine. To make it a real benchmark, the next step is to **hand-correct `Final02`** in ITK-SNAP wherever I disagree with my pipeline (for example the C6/C5 spot, or the C1 piece). Every method, including mine, then gets scored against a truly independent answer. More cases would help too: AbdomenAtlas, or TotalSegmentator/VerSe, which come with expert vertebra labels.
 
 ---
 
