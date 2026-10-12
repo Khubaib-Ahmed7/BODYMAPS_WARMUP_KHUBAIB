@@ -1,399 +1,333 @@
 # Cleaning up AI vertebra labels on CT scans
 
-*What I started with, what was wrong with it, what I built, and what I'm doing next.*
+SuPreM is good at finding the spine in a CT scan, but its vertebra labels are not clean enough to use as they are. Vertebrae come out split between two colours, small blobs float around them, the back of the spine is often painted with the wrong label, and now and then a piece of a completely different bone is labelled as a vertebra.
+
+This document describes the post-processing I built to fix that. It explains what the AI gets wrong, what two existing approaches do about it and where they fall short, how my pipeline works and why each part works, what I tried that didn't work, how I measure the results, and what still needs to be done.
+
+<p align="center"><img src="Images/doc_figures/raw_vs_final_patient31.png" width="760"></p>
+<p align="center"><sub><b>Patient 31, lower spine.</b> Left: the AI's labels. Several vertebrae carry two colours, L1 has almost disappeared, and there are even C6/C7 labels in the middle of the thoracic spine. Right: the same scan after my pipeline.</sub></p>
 
 ---
 
-## TL;DR
+## Contents
+1. [The problem](#1-the-problem)
+2. [Two existing approaches](#2-two-existing-approaches)
+3. [My pipeline](#3-my-pipeline)
+4. [Things that look wrong but aren't](#4-things-that-look-wrong-but-arent)
+5. [What I tried that didn't work](#5-what-i-tried-that-didnt-work)
+6. [Measuring the result: a scoring system](#6-measuring-the-result-a-scoring-system)
+7. [Results](#7-results)
+8. [Limitations](#8-limitations)
+9. [Next steps](#9-next-steps)
+10. [Running it](#10-running-it)
+11. [References](#11-references)
 
-| | |
+---
+
+## 1. The problem
+
+The task, from the brief: run SuPreM's vertebra model on the AbdomenAtlas demo CTs (patients 6 and 31), look at the masks in ITK-SNAP, and write an automatic post-processing step, `postprocessing_vertebrae.py`, that removes as many of the errors as possible.
+
+The model gives every voxel a number from 0 (background) to 24: **1 = L5 … 5 = L1, 6 = T12 … 17 = T1, 18 = C7 … 24 = C1.** The errors fall into a few kinds:
+
+| Error | What it looks like |
 |---|---|
-| **The problem** | The AI (SuPreM) colours every vertebra in a CT scan, but leaves loose specks, wrong colours on the back of the spine, broken pieces and holes. |
-| **My first try** | Cut the spine at the discs (dark dips in a bone-per-slice curve) and count the "drums". Great on thin slices, but it fell apart on thick slices and curved spines. |
-| **What existed** | Two clean-up approaches: **ShapeKit-Pro** and the **Hao pipeline**. Each fixed some things and broke or missed others. |
-| **What I built** | **One script** (`direct_inference/postprocessing_vertebrae.py`) that runs Pro, polishes the result, **removes the specks Pro left behind**, and then **checks the vertebra names against the ribs and sacrum**. |
-| **Main fixes of mine** | 1. Specks that *looked* loose but were hidden-connected → removed. 2. Same thing on thick-slice scans. 3. A name checker that gave false alarms → rewritten and tested. 4. Four scripts merged into one, proven to give identical output. |
-| **Scoring** | An **ideal mask** (`Final02`) plus a **scoring script** (Dice, surface distance, naming, specks → one 0–100 score) that rates any prediction against it. |
+| **Wrong borders** | one vertebra is painted half in its own colour and half in its neighbour's |
+| **Wrong names** | a whole stretch is shifted by one level (on patient 31 the AI calls L1 "T12", T12 "T11", and so on) |
+| **Broken vertebrae** | one vertebra is split into several separate pieces |
+| **Specks** | small blobs of colour that look like they float next to a vertebra |
+| **Wrong back parts** | the spinous processes slope down over the vertebra below, so the AI often gives them the lower vertebra's label |
+| **Other bones** | skull or pelvis painted as a vertebra |
+
+The two scans are also quite different: patient 31 has thin slices (0.7 mm), patient 6 has thick ones (2.5 mm). Thick slices turned out to matter a lot, as several sections below show.
 
 ---
 
-## 1. Where I started
+## 2. Two existing approaches
 
-### The task
-From the brief (`direct_inference/vertebrae.md`): run SuPreM's vertebra model on the AbdomenAtlas demo CTs (patients **6** and **31**), look at the masks in ITK-SNAP ("you will see many errors"), and **design an automatic post-processing** that removes as many errors as possible, in one file: `postprocessing_vertebrae.py`.
+Two clean-up methods had already been written for this task. I studied both closely, because between them they cover most of what a good solution needs.
 
-### The AI: SuPreM
-SuPreM is a pre-trained 3D segmentation model. Given a CT scan, its vertebra model paints each vertebra in its own colour (label), from **L5 (1)** up to **C1 (24)**. It's good, but not clean enough to use as is.
+### 2.1 Hao's method: stable cores
 
-### Two existing clean-up approaches
+Hao Yu's method [1], now part of the ShapeKit toolkit [2], starts from a clever observation. If you shrink the spine mask step by step, touching vertebrae come apart into thick "cores", one per vertebral body. Those cores tell you where the bodies really are without trusting the AI's colours, and from them each body can grow back through bone to find its true borders.
 
-| | **ShapeKit-Pro** | **Hao pipeline** |
-|---|---|---|
-| Who | Abhijit Das (credited in the code) | Hao Yu |
-| Idea | Redraw borders using the CT itself: discs show up as **dark dips** between vertebrae; every step undoes itself if it doesn't improve things | Find the vertebral **bodies** as stable "cores" (shrink the mask until the bodies separate), without trusting the AI's colours, then let each core **grow through bone** to decide the borders ("stable cores + geodesic consensus") |
-| What it edits | the whole spine | **only L2–T5**; every other vertebra is locked exactly as the AI drew it |
-| Speed (patient 31) | ~11 min | ~6 min |
-| Output | `Refined_Pro/` | `Refined_Hao/` (with its own `report.json`, `qa/` and `run_manifest.json`) |
-| Code | [aj-das-research/jhu-bodymaps-warmup](https://github.com/aj-das-research/jhu-bodymaps-warmup) | the `shapekit_hao` backend in [BodyMaps/ShapeKit](https://github.com/BodyMaps/ShapeKit): [engine](https://github.com/BodyMaps/ShapeKit/blob/main/utils/vertebrae_hao_engine.py), [docs](https://github.com/BodyMaps/ShapeKit/blob/main/docs/VERTEBRAE_HAO.md), [pull request #16](https://github.com/BodyMaps/ShapeKit/pull/16) |
+From the front, the result looks clean:
 
----
+<p align="center"><img src="Images/Haos_FRONT_GOOD.png" height="460"></p>
 
-## 2. My first attempt: cutting the spine at the discs ("drums")
-
-Before working with Pro and Hao, I tried my own approach.
-
-### The idea
-A vertebral body is bright, solid bone. The disc between two bodies is darker and softer. So if I walk up the spine **slice by slice, from the feet to the head**, and measure how much bone there is in the **front part** of the spine (the bodies), I should get a curve that **dips at every disc**. Cut at the dips, and each piece in between is one vertebral body, a "drum". Then:
-
-1. **Count the drums** from the bottom (L5 upwards) **and** from the top (C1/C2 downwards), and check that both counts agree (`find_discs.py`).
-2. **Use the drums to fix the AI's labels** (`fix_vertebrae.py`):
-   - remove floating blobs;
-   - split drums that are too tall, where the AI's colour changes inside them;
-   - name the drums by trying every possible naming and scoring each one. The rules: names go up by exactly one per drum; a repeated name is only OK if the two drums together are one normal height; a skipped name is only OK if the drum is tall enough to hold the missing one; never more than 2 away from what the AI said; agreeing with the AI is cheaper;
-   - give the back parts (arches) the name of the drum they're attached to through the pedicle;
-   - sanity-check the sizes (L > T > C) and how much was changed.
-
-### How it went
-On **patient 31** (thin 0.7 mm slices) it worked really well: clean dips at every disc and **22 drums from L5 all the way up to C3**:
-
-<p align="center"><img src="Images/doc_figures/disc_profile_patient31.png" width="900"></p>
-
-On **patient 6** (thick 2.5 mm slices) it broke. In the middle of the thoracic spine the discs **don't show up as dips** anymore, so the "T7" and "T6" drums each swallow **2–3 vertebrae**. Counting from the bottom then runs out at "**T4**", even though the scan goes all the way up into the neck:
-
-<p align="center"><img src="Images/doc_figures/disc_profile_patient6.png" width="900"></p>
-
-### What I learned (and why I moved on)
-- **Thick slices hide discs.** This turned out to be the theme of the whole project. The same problem came back later in the specks (4.3) and in the old name checker (4.4).
-- **Slice-by-slice is too simple for a curved spine.** Where the spine bends, one flat slice cuts through two vertebrae at once and the dip gets blurred. Pro measures brightness on discs **perpendicular to the spine** instead, which is the grown-up version of the same idea.
-- **Drums only cover the bodies.** The arches and spinous processes need their own handling, and Pro already does that properly (regrowing them from the pedicles).
-
-So instead of rebuilding all of that myself, I took **Pro** (which already had the better version of my disc idea) as the base, and focused on what it still got wrong.
-
----
-
-## 3. What was wrong with each
-
-### 3.1 Hao: the front looks good, the back doesn't
-
-From the front, Hao's result looks clean. Every vertebral body has one colour:
-
-<p align="center"><img src="Images/Haos_FRONT_GOOD.png" height="520"></p>
-
-But from the side and back, **parts of the arches and spinous processes are painted in the neighbour's colour**. You can see a vertebra's back part in the colour of the one above or below, and little tips of a different colour:
+From the side and the back it does not:
 
 <table>
 <tr>
-<td align="center"><img src="Images/Haos_BACK_1_BAD.png" height="460"><br><sub>Lower spine: wrong-coloured patches on the arches (e.g. cyan inside purple, orange on blue)</sub></td>
-<td align="center"><img src="Images/Haos_Back_2_BAD.png" height="460"><br><sub>Upper spine: spinous tips carrying the wrong colour (e.g. red tip on the cream vertebra). This is mostly above T5, where Hao doesn't edit, so these are the AI's own mistakes left in place.</sub></td>
+<td align="center"><img src="Images/Haos_BACK_1_BAD.png" height="420"><br><sub>Lower spine: patches of the wrong colour on the arches (cyan inside purple, orange on blue).</sub></td>
+<td align="center"><img src="Images/Haos_Back_2_BAD.png" height="420"><br><sub>Upper spine: spinous tips with the wrong colour. This part lies outside the range Hao edits, so these are the AI's own mistakes, left in place.</sub></td>
 </tr>
 </table>
 
-Why: Hao's method is built around the **bodies** (the cores), and its own report says so: *"No height-based posterior seeds. Unreachable/ambiguous regions retain v2."* In other words, wherever it can't safely reach the back of the spine, it **keeps the AI's original colours**, mistakes included. That part is hard anyway, because the spinous processes **droop down over the vertebra below**, so they easily get handed to the wrong owner. On top of that, Hao only edits **L2–T5**, so nothing above or below that range is touched. On patient 31 it changed 360,603 voxels, and every body core ended up with a single colour (purity 1.0).
+There are two reasons. The cores only describe the **bodies**. For the back of the spine, the method's own report says *"unreachable/ambiguous regions retain v2"*, so wherever it can't safely reach, it keeps the AI's original colours, mistakes included. And it only edits **L2 to T5**; every other vertebra stays exactly as the AI drew it.
 
-### 3.2 ShapeKit-Pro: the shapes are good, but specks are left
+### 2.2 ShapeKit-Pro: evidence from the CT
 
-Pro fixes the borders and the back of the spine well (its audit went from 21 broken vertebrae to 0 on patient 31), **but it leaves small blobs of colour**:
+ShapeKit-Pro by Abhijit Das [3] takes the other route. It reads the anatomy out of the CT itself:
+- discs show up as dark dips in brightness along the spine;
+- the arch of each vertebra hangs on its body through the two pedicles;
+- every editing step measures itself and undoes the change if things got worse.
+
+It repairs the whole spine and handles the back of it properly, which is exactly where Hao's method stops.
+
+What it leaves behind are **specks**:
 
 <table>
 <tr>
-<td align="center"><img src="Images/Pro_front_Specks.png" height="460"><br><sub>Pro: small cyan/teal specks sitting on other vertebrae</sub></td>
-<td align="center"><img src="Images/doc_figures/pro_specks_closeup_patient31.png" height="460"><br><sub>Close-up: two blobs that look completely loose</sub></td>
+<td align="center"><img src="Images/Pro_front_Specks.png" height="420"><br><sub>Small blobs of the wrong colour sitting on other vertebrae.</sub></td>
+<td align="center"><img src="Images/doc_figures/pro_specks_closeup_patient31.png" height="420"><br><sub>Close-up on patient 31: two blobs that look completely loose.</sub></td>
 </tr>
 </table>
 
-**The weird part:** Pro (and the cleanup after it) has rules to remove loose specks. So why didn't they fire?
-
-I checked and found that **the code thought these blobs were connected**. It used "26-neighbour" connectivity, where two voxels count as touching if they share even **one corner**. A 3D viewer only joins voxels that share a **face**. So a blob touching its vertebra at a single corner, or hanging off it by a 1-voxel strand, **looks separate on screen but is "connected" to the code**, and the speck rules never even looked at it.
-
-<p align="center"><img src="Images/doc_figures/specks_explained.png" width="900"></p>
-
-How many were there? On patient 31, every vertebra was "one piece" according to the code, but counting face-only there were **76 loose pieces** (T11 alone was in 28 pieces), plus **146 blobs on thin strands**.
+The strange part is that the code *has* rules for removing loose pieces, and they never fired on these blobs. The reason took me a while to find, and it is the starting point of my own work (section 3.3).
 
 ---
 
-## 4. What I built on top
+## 3. The pipeline
 
-### 4.1 One pipeline, one command
-
-Before, there were 3 steps across 4 files (`pro_postprocessing_vertebrae.py` → `finalize_vertebrae.py`, which uses `check_names.py` and `postprocessing_vertebrae.py`). I merged everything into **one file**:
+I wanted a single script that keeps the strengths of both approaches and fixes what they miss. I worked through the same core ideas myself: reading the discs out of the CT, finding bodies without trusting the colours, and counting vertebrae from anatomical landmarks. In the end, the most complete implementation of the boundary repair was ShapeKit-Pro's, so step 1 adapts it. Steps 2 and 3 deal with what was still wrong afterwards.
 
 ```mermaid
 flowchart LR
-    A[AI prediction<br>+ CT] --> P1[PART 1<br>ShapeKit-Pro<br>big repair]
-    P1 --> P2[PART 2<br>cleanup<br>strays, holes, dents]
-    P2 --> P3[PART 3<br>specks<br>my fix]
-    P3 --> OUT[final labels]
-    P3 --> P4[PART 4<br>checks<br>report only]
-    A --> H[second-opinion<br>pipeline] --> P4
-    P4 --> R[report.json<br>review.nii.gz<br>landmarks.nii.gz]
+    A["AI labels<br>+ CT"] --> S1["1. repair<br>borders, broken pieces,<br>back of the spine"]
+    S1 --> S2["2. cleanup<br>strays, holes, dents"]
+    S2 --> S3["3. specks<br>thin necks, corner joins,<br>other bones"]
+    S3 --> OUT["combined_labels.nii.gz<br>+ one file per vertebra"]
 ```
 
-```bash
-python postprocessing_vertebrae.py --pred_dir ../AbdomenAtlasDemoPredict \
-    --ct_root ../AbdomenAtlasDemo --out_dir ../Final --case BDMAP_00000031
-```
+One rule runs through all of it: **the CT decides.** Bone is bright (150 HU and above), discs and soft tissue are darker. A label only changes when the CT supports the change, and most steps undo themselves if they made things worse.
 
-**How I made sure merging didn't break anything:** I ran the old 3-step chain and the new single file on the same patient, with my speck step switched off, and compared every output. Labels, review mask, landmarks, all 24 per-vertebra files, every report field and Pro's log were **identical, voxel for voxel**. Only then did I switch my new parts on.
+### 3.1 Step 1: repair
 
-### 4.2 My speck removal (PART 3)
+This is the heaviest part. It runs nine stages in order:
 
-The idea: **measure how thick the connection is**, not just whether it exists.
+| Stage | What it does, and why it works |
+|---|---|
+| **Triage** | Every loose piece of a vertebra is judged by the CT. Tiny pieces and pieces that aren't bone are deleted, because the AI imagined them. Bone close to its vertebra is reconnected. Bone far away is set aside. |
+| **Islands** | A piece wrapped mostly by another vertebra takes that vertebra's label. Vertebrae don't grow inside each other. |
+| **Redraw borders** | Only for vertebrae that look wrong (broken, odd size, lost a lot of bone). It finds the discs as dips in CT brightness, then lets each vertebra grow through bone until they meet in the dark gaps (see the figure below). The arch is regrown from the pedicles. |
+| **Polish** | A border that is suspiciously flat is moved onto the darkest line of the gap. Real joints are bumpy, so a flat border is usually an artificial cut. |
+| **Smooth** | Smooths jagged surfaces by at most 1.5 mm, and undoes this for any vertebra that changes too much. |
+| **Give bone back** | The bone set aside in triage goes back to the vertebra it is joined to *through bone*. |
+| **Three views** | A voxel is relabelled only if the front, side and top views all agree. |
+| **Mixed pieces** | A solid piece of bone carrying two labels gets one. |
+| **Spinous processes** | Labels may only flow *downward* from where a spinous process starts, so a drooping tip keeps its own vertebra's label. |
 
-1. **Shrink each vertebra by 1 mm, then 1.5 mm.** Any strand or neck thinner than about 2–3 mm disappears, so a blob hanging on by it comes loose.
-2. **Also treat corner-only and edge-only joins as loose.**
-3. For every loose bit **smaller than 150 mm³** (roughly a grain of rice):
-   - if it sits **on another vertebra** → it gets **that vertebra's colour**;
-   - if it sits **on nothing** → it's **deleted**.
-4. Repeat until nothing changes (it settles after 2 rounds).
+The key idea is that **discs are visible in the CT**. Measuring brightness on disks laid across the spine, tilted with it so a curved spine doesn't blur the signal, every disc shows up as a dip:
 
-**How I picked the limits:** I measured it. Necks under 3 mm only ever cut off small blobs (the biggest was 84 mm³). From 4 mm upwards, real anatomy starts coming loose: cervical transverse processes of about 1,000 mm³, and the C1 arch at 2,700 mm³. So "neck < 3 mm and < 150 mm³" catches the specks without touching real bone.
+<p align="center"><img src="Images/code_figures/1_disc_dips.png" width="860"></p>
+<p align="center"><sub>Patient 31. Left: the spine's centre line (yellow) and the measuring disks (cyan). Right: brightness along the spine; every red line is a disc.</sub></p>
 
-**Results:**
+Not every disc gives a clean dip. That's why this stage only redraws stretches that already look wrong, and keeps the change only if a check of the whole spine (broken pieces, sizes, order) got better.
 
-| Patient 31 | Before | After |
-|---|---|---|
-| Loose pieces (face-only) | 76 | **0** |
-| Blobs on thin necks (< 3 mm) | 146 | **0** |
-| Vertebrae in more than one piece | 18 | **0** |
-| Volume changed | — | 2.8 cm³ of 897 cm³ (**0.3 %**) |
-| Shape kept (Dice per vertebra) | — | ≥ 0.993, except C5 (0.983) |
-| Real processes kept (the ones that only come loose at 4 mm) | 4 | 4 |
+### 3.2 Step 2: cleanup
 
-<table>
-<tr>
-<td align="center"><img src="Images/Pro_front_Specks.png" height="440"><br><b>Pro</b>: specks</td>
-<td align="center"><img src="Images/Ours_front.png" height="440"><br><b>Mine</b>: front, clean</td>
-<td align="center"><img src="Images/Ours_back.png" height="440"><br><b>Mine</b>: back, clean arches and spinous processes</td>
-</tr>
-</table>
+Three small fixes that the repair leaves to do:
+- **Threads:** a bit hanging on its vertebra by a thread one voxel thin, but sitting on another vertebra, takes the other vertebra's label.
+- **Strays:** small loose pieces mostly surrounded by another vertebra take that vertebra's label.
+- **Holes and dents:** holes inside a vertebra and small dents in its surface are filled, but only where the CT shows bone, so the spinal canal is never filled, and never next to another vertebra, because that gap is the disc.
 
-I also stress-tested it on four other outputs of the same patient (Pro, Hao and two older refinements). It removed every thin-neck speck in all of them.
+As a safety net, no vertebra may grow by more than 3 %, and if any vertebra ends up in more pieces than before, the whole cleanup is undone.
 
-### 4.3 Thick-slice scans (patient 6)
+### 3.3 Step 3: specks, and why they survived everything else
 
-On patient 6 I still saw **one magenta dot**:
+**Why the specks survived.** Two voxels can count as "touching" in two ways: when they share a **face**, or already when they share a **corner**. A 3D viewer like ITK-SNAP only joins faces. Code that counts corners will call a blob "connected" when it touches its vertebra at a single corner, or hangs on a strand one voxel thin. On screen that blob looks loose; in the code it's part of the vertebra, so no speck rule ever looks at it.
 
-<p align="center"><img src="Images/doc_figures/thick_slice_speck_patient6.png" width="420"></p>
+<p align="center"><img src="Images/doc_figures/specks_explained.png" width="860"></p>
 
-Looking for the cause, I found a real gap in my speck rule. Patient 6's slices are **2.5 mm thick** (patient 31's are 0.7 mm), and a 1–1.5 mm shrink **can't reach the next slice**. So a blob joined only through the slice above or below was never cut. That was an assumption in my own rule.
+On patient 31 the old code said every vertebra was one piece. Counted by faces there were **76 loose pieces**, plus **146 blobs on thin strands**. T11 alone was in 28 pieces.
 
-The obvious fix (always shrink up and down too) was **too aggressive**. It deleted 3 cm³, mostly real bone in the thin neck vertebrae, and created new loose pieces. So I made it narrower: **only on thick-slice scans**, delete pieces **≤ 50 mm³** that are joined through a single slice **and touch no other vertebra**.
+**The fix: measure how thick the connection is.** Instead of asking *whether* a blob is connected, I ask *how thickly*:
+1. Shrink each vertebra by 1 mm, then by 1.5 mm. Anything joined by a neck thinner than about 2–3 mm comes loose.
+2. Treat pieces touching only at a corner or an edge as loose too.
+3. A loose bit up to 150 mm³ (about a grain of rice) is a speck. If it sits on another vertebra, it takes that vertebra's label; if it sits on nothing, it is deleted.
+4. Repeat until nothing changes.
 
-- It removed 8 small floaters like that (e.g. an 8-voxel bit of T12).
-- Only 233 mm³ changed in total; every vertebra kept ≥ 99.8 % of its shape.
-- Patient 31 is **provably unchanged**: with thin slices this extra step never runs.
+The limits come from measurements, not guesses. Necks thinner than 3 mm only ever cut off small blobs (the biggest was 84 mm³). From 4 mm upwards real anatomy starts coming loose: transverse processes of the neck at around 1,000 mm³, the arch of C1 at 2,700 mm³.
 
-**But the magenta dot was still there.** It turned out not to be one of those floaters at all:
+<p align="center"><img src="Images/code_figures/3_specks_T11_before_after.png" width="820"></p>
+<p align="center"><sub>T11 on patient 31: 28 pieces before this step, 1 after. Grey is the vertebra, red the loose bits.</sub></p>
 
-#### A "speck" that wasn't one: the viewer's smoothing
-The dot sits in a notch of the cyan vertebra. In my colour table magenta = **T10** and cyan = **T11**:
+**Thick slices.** On patient 6, with its 2.5 mm slices, a 1.5 mm shrink cannot reach the slice above or below. A blob joined only through a neighbouring slice was never cut. Shrinking up and down as well on every scan was far too aggressive: it ate real bone in the thin neck vertebrae. So this extra pass only runs on thick-slice scans, and it only removes pieces up to 50 mm³ that touch no other vertebra.
 
-<table>
-<tr>
-<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_on.png" height="300"><br><sub>ITK-SNAP with <b>3D Gaussian smoothing ON</b>: looks like a floating dot</sub></td>
-<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_off.png" height="300"><br><sub>Same spot, <b>smoothing OFF</b>: it's a tip of T10, attached</sub></td>
-</tr>
-</table>
+**Bones that aren't part of the vertebra at all.** After all this, C1 on patient 6 was still in two pieces. The second piece sat above and behind the C1 ring, on the back rim of the hole in the skull base. It is **skull**, which the AI had painted as C1:
 
-This time the code wasn't wrong. When I checked the CT at the most likely spot (about voxel 255, 123, slice 212):
-- it's a **thin tip of T10's back part**. The back of a vertebra slopes **down**, so this tip rests right on T11;
-- the CT there is **about 440 HU**, which is solid bone, so it's real;
-- it is **still part of T10** (one connected piece), so the speck step correctly leaves it alone.
+<p align="center"><img src="Images/doc_figures/c1_skull_piece_patient6.png" width="860"></p>
 
-<p align="center"><img src="Images/doc_figures/spinous_tip_ct_slices.png" width="900"></p>
-
-So why did it look loose? On patient 6's 2.5 mm slices the tip is only **1–2 slices thick**. ITK-SNAP's **3D Gaussian smoothing** blurs the mask before drawing the surface, and a link that thin gets smoothed away, so the tip shows up as a separate blob. With smoothing turned **off**, it's clearly joined to T10.
-
-**Lesson:** not every dot in a 3D render is an error. Before "fixing" one, check the CT and the raw (unsmoothed) mask. Recolouring this tip as T11 would actually make the label **wrong**: the back parts of a vertebra belong to the vertebra they start from, and keeping it that way is one of the things Pro was built to do.
-
-### 4.4 The rib and sacrum name check (PART 4b)
-
-#### What it's for
-Pro and the cleanup fix **shapes and borders**, but they **trust the AI on names**. The classic AI mistake is calling every vertebra **one level off** (the real L5 labelled L4, and so on), especially on abdominal CTs where you can't count from the top. In that case Pro produces clean, beautiful vertebrae **with the wrong names**, and its audit still says "all fine".
-
-The name check is the only part that looks at **anatomy outside the spine labels**:
-- the vertebra sitting **on the sacrum** must be **L5**;
-- the lowest vertebra with **ribs on both sides** must be **T12**;
-- the highest one with ribs must be **T1** (used only if all 12 rib levels were found).
-
-It counts from these landmarks and compares with the AI's names.
-
-#### It doesn't change labels, on purpose
-It **only reports**: a verdict in `report.json`, and the vertebrae with suspicious names marked in `review.nii.gz`. About 1 in 10 people have unusual anatomy (11 or 13 rib pairs, L5 fused into the sacrum, a sixth lumbar vertebra). For them the rib/sacrum rule itself is wrong, and an automatic rename would silently turn correct labels into wrong ones. As a flag, the worst case is that someone double-checks a scan that was fine.
-
-#### The bug I found
-On patient 6, the old checker said **NEEDS_BOUNDARY_FIX** ("L4 should be L5", "T2 should be T3"…). I checked the CT myself, and **the labels were right; the checker was wrong**:
-
-1. **It lost vertebrae.** It found only 16 of 24 bodies on these thick slices (missing L5, T5, T1, C7–C3, C1), and counted names on what it found. So every missing body shifted all the names after it.
-2. **It matched ribs to vertebrae by height only.** On a curved spine, T12's rib sits at the height of L1, so it said "L1 has ribs".
-3. **Its "sacrum" was the whole pelvis** (221 mm wide), sitting **on top of L5**, because it searched under the lowest body it *found*, which was L4.
-4. **False alarms:** a "second L4 body" that was really L4's **arch**, and "T5/T6 mixed" because the thin disc between them doesn't show on 2.5 mm slices.
-
-<p align="center"><img src="Images/doc_figures/ribs_sacrum_old_vs_new.png" width="900"></p>
-<p align="center"><img src="Images/doc_figures/checker_false_alarms_patient6.png" width="900"></p>
-
-#### What I changed
-- **Count names on the labelled vertebrae**, not on the bodies it manages to find, so a body that's hard to see can't shift the count.
-- **Each rib goes to the vertebra it actually touches** (closest point in 3D), not to whichever one is at the same height.
-- **Look for the sacrum under the lowest labelled vertebra.**
-- **Only use "highest rib = T1" if 12 rib levels are found.** The first rib is often missed, and it was missed on **both** patients, so the old rule was only right on patient 31 by luck.
-- **Ignore false alarms:** cores on an arch, two neighbours merged across an unseen disc, and skull-base bone next to C1/C2 that looks like a rib.
-
-#### Tests: it still catches real errors
-I fed it the real labels and two kinds of deliberately broken labels, on both patients:
-
-| Test | Patient 31 | Patient 6 |
-|---|---|---|
-| Real labels | ✅ CONFIRMED | ✅ CONFIRMED (was NEEDS_BOUNDARY_FIX) |
-| Every name shifted by one level | ✅ WRONG_NAMES | ✅ WRONG_NAMES |
-| Top 40 % of L3 relabelled as L2 | ✅ NEEDS_BOUNDARY_FIX | ✅ NEEDS_BOUNDARY_FIX |
+Every earlier rule is built to *keep* bone, so none of them removed it. The question none of them asked was: **is this piece joined to its vertebra through bone?** So the last rule draws lines across the gap between a loose piece and its vertebra and reads the CT along them. If no line stays at bone level all the way across, they are two separate bones, and the piece is deleted (up to 2 cm³, and only if it touches no other vertebra). On patient 6 this removed exactly that skull piece. On every other output I tested, it fired once more: on the same skull piece in the raw AI prediction.
 
 ---
 
-## 5. Side by side
+## 4. Things that look wrong but aren't
 
-| | Hao | ShapeKit-Pro | **Mine** |
-|---|---|---|---|
-| Vertebral bodies (front) | ✅ clean | ✅ clean | ✅ clean |
-| Arches / spinous processes (back) | ❌ neighbour's colour | ✅ | ✅ |
-| Loose specks | — | ❌ hidden-connected blobs | ✅ removed (76 → 0) |
-| Thick-slice scans | — | ❌ | ✅ |
-| Range edited | L2–T5 only | whole spine | whole spine |
-| Name check (ribs/sacrum) | — | — | ✅ fixed, tested, report only |
-| One command | — | — | ✅ |
+Not every odd shape in a 3D view is an error, and "fixing" these would make the labels worse.
+
+### 4.1 A dot that is really a thin tip
+
+On patient 6 I kept seeing a small magenta dot sitting in a notch of the next vertebra. With ITK-SNAP's **3D Gaussian smoothing** turned off, it is clearly attached:
+
+<table>
+<tr>
+<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_on.png" height="280"><br><sub>Smoothing on: looks like a floating dot.</sub></td>
+<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_off.png" height="280"><br><sub>Smoothing off: the tip of T10, attached.</sub></td>
+</tr>
+</table>
+
+It is a thin tip of T10's back part resting on T11. The CT shows solid bone there (about 440 HU), and it is one piece with T10. On 2.5 mm slices the tip is only one or two slices thick, and the viewer's smoothing blurs that thin link away. Giving it to T11 would be wrong: the back parts of a vertebra belong to the vertebra they grow from.
+
+<p align="center"><img src="Images/doc_figures/spinous_tip_ct_slices.png" width="860"></p>
+
+### 4.2 C6 "growing into" C5
+
+<p align="center"><img src="Images/Ours_C6_growing_into_C5.png" width="720"></p>
+
+At first glance C6 (blue) pushes a tongue up into C5 (grey). I think this is real bone. In the neck, the top of each vertebral body from C3 to C7 has raised lips on both sides, the **uncinate processes**, which hook upward beside the vertebra above. A piece of C6 reaching up next to C5 is what normal anatomy looks like, and every voxel the pipeline adds has to be bone on the CT. I still want to confirm it slice by slice.
+
+---
+
+## 5. What I tried that didn't work
+
+### 5.1 Counting vertebrae from a brightness curve
+
+One idea was to walk up the spine slice by slice, measure how much bone there is in the front part, cut at the dips (the discs) and count the pieces, both from the bottom and from the top.
+
+On patient 31 this works well: 22 clean segments from L5 up to C3.
+
+<p align="center"><img src="Images/doc_figures/disc_profile_patient31.png" width="860"></p>
+
+On patient 6 it fails. With thick slices the discs in the middle of the thoracic spine no longer show up as dips, so two segments each swallow two or three vertebrae, and the count from the bottom runs out at "T4" while the scan reaches the neck.
+
+<p align="center"><img src="Images/doc_figures/disc_profile_patient6.png" width="860"></p>
+
+Two lessons came out of this. Flat slices blur the discs wherever the spine curves, and measuring *across* the spine instead (as in step 1) avoids that. And thick slices hide discs, which came back to bite me several more times.
+
+### 5.2 Checking the names against the ribs and the sacrum
+
+Nothing in the pipeline checks the vertebra **names**. If the AI calls every vertebra one level off, the repair produces beautiful vertebrae with the wrong names. So I built a check:
+- the vertebra sitting on the sacrum must be L5;
+- the lowest vertebra with ribs on both sides must be T12;
+- the highest with ribs must be T1.
+
+Its first version raised a false alarm on patient 6. With thick slices it lost track of several vertebrae, matched ribs to vertebrae by height only (on a curved spine, T12's rib sits at the height of L1), and took the whole pelvis for the sacrum:
+
+<p align="center"><img src="Images/doc_figures/ribs_sacrum_old_vs_new.png" width="820"></p>
+
+After fixing that, by counting on the labels and assigning ribs by what they actually touch, it confirmed the names on both patients and still caught deliberately shifted names. In the end I removed it from the script, because it only ever *reported*. It can't safely rename anything: about one person in ten has unusual anatomy (11 or 13 rib pairs, an L5 fused into the sacrum), and there an automatic rename would turn correct labels into wrong ones. It is a good candidate for a separate validation tool.
+
+### 5.3 Smaller dead ends
+- **Shrinking up and down on every scan** to catch the thick-slice specks deleted 3 cm³ of real bone in the neck, so it became the narrow thick-slice rule in 3.3.
+- **Replacing the `cc3d` library with scipy** gives the same pieces but numbers them in a different order, and that order changes the repair's results slightly, so `cc3d` stays.
+- **A second, independent pipeline** run alongside as a second opinion never influenced the labels, so it was dropped.
+
+---
+
+## 6. Measuring the result: a scoring system
+
+Looking at 3D renders is how I found most problems, but it can't tell whether one version is better than another. So I made a reference mask for both patients (`Final02/`) and wrote `score_vertebrae.py`, which compares any prediction against it, vertebra by vertebra:
+
+| Measure | Question it answers | Best |
+|---|---|---|
+| **Dice** | How much does the predicted vertebra overlap the reference? | 1.0 |
+| **HD95** | How far off is the surface, in mm (ignoring the worst 5 %)? | 0 mm |
+| **Naming** | Does most of the vertebra carry the right label? | yes |
+| **Extra pieces** | Are there loose bits the reference doesn't have? | 0 |
+
+They are combined into one number:
+
+**score = 100 × (0.5 × mean Dice + 0.2 × naming + 0.2 × surface + 0.1 × clean)**
+
+where *surface* is 1 − HD95 / 10 mm per vertebra (10 mm or worse counts as 0), and *clean* is the share of vertebrae without extra pieces.
+
+Dice alone isn't enough. One added speck barely moves it (1.0 → 0.9998), and a swapped name hurts it only indirectly. I checked the score on artificial cases:
+
+| Test case                  | Score |
+| ----------------------------| -------|
+| identical to the reference | 100   |
+| shifted by 2 mm            | 91    |
+| one speck added            | 96.7  |
+| one vertebra missing       | 66.7  |
+| two names swapped          | 40    |
+
+---
+
+## 7. Results
+
+<p align="center"><img src="Images/doc_figures/scores_patient31.png" width="760"></p>
+
+| Patient 31 | Score | Mean Dice | Worst vertebra | HD95 (mm) | Naming | Clean |
+|---|---|---|---|---|---|---|
+| Raw AI prediction | 63.9 | 0.761 | L1, 0.15 | 10.7 | 0.79 | 0.08 |
+| Earlier refinement A | 72.0 | 0.809 | T11 missing | 6.9 | 0.88 | 0.25 |
+| Earlier refinement B | 72.0 | 0.876 | T7, 0.69 | 8.5 | 1.00 | 0.04 |
+| Hao | 78.6 | 0.919 | T8, 0.80 | 6.0 | 1.00 | 0.17 |
+| ShapeKit-Pro | 92.1 | 0.990 | C7, 0.97 | 0.4 | 1.00 | 0.33 |
+| Earlier version of this pipeline | 92.7 | 0.996 | C7, 0.98 | 0.03 | 1.00 | 0.29 |
+
+The table shows three things:
+- **The raw AI's naming problem is real.** It names T9 to L1 one level off on patient 31, which is why its L1 Dice is only 0.15.
+- **Hao's method fixes the bodies but stops short.** Its scores are held back by the stretches and back parts it doesn't touch.
+- **ShapeKit-Pro's shapes are already very close (Dice 0.99), but only a third of its vertebrae are clean.** The rest is specks, which is exactly what step 3 removes.
+
+What my pipeline changes, per patient:
 
 | | Patient 31 (0.7 mm slices) | Patient 6 (2.5 mm slices) |
 |---|---|---|
-| Run time | ~16 min | ~2.5 min |
-| Pro audit (broken / order / size) | 21 / 0 / 1 → 0 / 0 / 0 | 10 / 1 / 0 → 0 / 0 / 0 |
-| Specks fixed | 30 recoloured, 215 deleted | 70 recoloured, 90 deleted |
-| Vertebrae in > 1 piece | 18 → **0** | 13 → **1** (C1, see limits) |
-| Name check | CONFIRMED | CONFIRMED |
-| Pro vs second-opinion pipeline (bodies L2–T5) | agree on 5, differ on T11–T7 | agree on all 10 |
+| Problems found by the spine check (broken, size, order) | 22 → 0 | 11 → 0 |
+| Specks relabelled / deleted | 30 / 215 | 70 / 91 (one of them skull) |
+| Vertebrae in more than one piece | 18 → **0** | 13 → **0** |
+| Volume changed by the speck step | 2.8 of 897 cm³ (0.3 %) | 2.5 of 704 cm³ (0.4 %) |
+
+<table>
+<tr>
+<td align="center"><img src="Images/Ours_front.png" height="440"><br><sub>Front</sub></td>
+<td align="center"><img src="Images/Ours_back.png" height="440"><br><sub>Back: clean arches and spinous processes</sub></td>
+</tr>
+</table>
+
+**A caveat on the reference.** The reference mask currently *is* my pipeline's output, so my own result scores 100 by definition, and that number proves nothing. For now the scores only show how close other methods get to mine. Section 9 describes how to turn this into an independent benchmark.
 
 ---
 
-## 6. C6 "growing into" C5: I think this is real bone
+## 8. Limitations
 
-<p align="center"><img src="Images/Ours_C6_growing_into_C5.png" width="800"></p>
-
-Here C6 (blue) seems to push a tongue up into C5 (grey). At first it looks like a labelling error, but **I think this is real bone, not a mistake**:
-
-- In the neck (C3–C7), the top of each vertebral body has raised lips on both sides, the **uncinate processes**. They hook **upwards** beside the vertebra above. So a bit of C6 reaching up next to C5 is exactly what normal anatomy looks like.
-- My pipeline only adds voxels where the CT shows bone (hole/dent filling and Pro's reconnections are all bone-gated), so this tongue is bone on the scan, not something invented.
-
-I still want to confirm it slice by slice on the CT, but for now I'm treating it as anatomy rather than an error.
+- **The speck step deletes bone, and that could be wrong on another patient.** Shrinking a vertebra by 1–1.5 mm is how the step finds thin necks, but on a patient with very thin bone (osteoporosis, a fracture, a child's spine, an unusual process) the same shrink could cut off a piece of real vertebra, which would then be relabelled or deleted. The "no bone across the gap" rule could misjudge a real fragment whose connection is too thin to show up as bone on the CT. On patients 6 and 31 I saw no sign of this: the speck step changes well under 1 % of the spine volume, and on patient 31 every vertebra keeps at least 98 % of its shape. Two patients are not enough, though, and this needs aggressive testing on many more scans.
+- **Only two patients so far,** with one thin-slice and one thick-slice scan. Every limit in the speck step was measured on these two.
+- **The names are not checked.** If the AI shifts a whole stretch by one level and the repair doesn't catch it, the output keeps the wrong names (see 5.2).
 
 ---
 
-## 7. How the code works (simple version)
+## 9. Next steps
 
-Everything is in **`direct_inference/postprocessing_vertebrae.py`**. One rule runs through all of it: **only change something if the CT backs it up** (bone is bright, discs are darker), and **undo any step that doesn't make things better.**
-
-| Part | What it does, in plain words |
-|---|---|
-| **1. ShapeKit-Pro** | **Sort loose bits:** tiny → delete; not bone → delete; bone near its vertebra → reconnect. **Islands:** a piece wrapped by another vertebra joins it. **Redraw suspicious borders at the discs:** walk up the spine, every dark dip is a disc; vertebrae "grow" through bone from their middles and meet in the gaps. **Arches:** regrown from the pedicles, the two bony bridges to their own body. **Straighten flat cuts** onto the darkest line. **Put set-aside bone back** with its right owner. **Check colours from 3 views**: recolour only if all agree. **Fix mixed pieces.** **Spinous processes:** colour may only flow downward. **Smooth** edges, fill holes. |
-| **2. Cleanup** | Stray pieces sitting on another vertebra take its colour. Fill holes and small dents, but only where the CT shows bone (so the spinal canal is never filled). No vertebra may grow by more than 3 %. |
-| **3. Specks (mine)** | Shrink each vertebra 1–1.5 mm. Anything that comes loose (plus corner-only joins) and is < 150 mm³ goes to the vertebra it sits on, or is deleted. On thick-slice scans, also small floaters joined through one slice. |
-| **4a. Second opinion** | Runs a second, independent repair pipeline on the same scan and compares its bodies L2–T5 with ours. It uses Hao's "cores" idea plus rib/sacrum naming and a disc re-cut, but it is **not** Hao's original program; the code calls it `run_hao` / `--no_hao_check` for historical reasons. Disagreements are marked in `review.nii.gz` (value 1). |
-| **4b. Name check (mine, rewritten)** | Sacrum → L5, lowest ribs → T12, (highest ribs → T1). Verdict CONFIRMED / WRONG_NAMES / NEEDS_BOUNDARY_FIX / UNSURE. Wrong names are marked in `review.nii.gz` (value 2). |
-
-### Output files (`Final/<patient>/`)
-
-| File | What it is |
-|---|---|
-| `combined_labels.nii.gz` | the cleaned labels, all vertebrae in one file |
-| `segmentations/vertebrae_*.nii.gz` | the same, one file per vertebra |
-| `review.nii.gz` | places to look at (1 = Pro and the second-opinion pipeline disagree, 2 = name doesn't match the anatomy) |
-| `landmarks.nii.gz` | the ribs (coloured by their vertebra) and the sacrum (25) the checker found |
-| `report.json` | every decision and number |
-| `pro_qa.json` | ShapeKit-Pro's detailed log |
-
-### Main settings I added (in `FIN_CFG`)
-
-| Setting | Value | Meaning |
-|---|---|---|
-| `speck_neck_radii_mm` | 1.0, 1.5 | how far to shrink; necks thinner than ~2× this are cut |
-| `speck_max_mm3` | 150 | loose bits up to this size count as specks |
-| `speck_host_frac` | 0.5 | share of a speck's outside that must be another vertebra for it to take that colour |
-| `speck_thick_max_mm3` | 50 | thick slices only: size limit for floaters joined through one slice |
-
-Switches: `--no_specks` (old behaviour), `--no_hao_check` (skip the second pipeline, about 1 min faster).
+1. **Rigorous testing on the remaining ~300 CT scans of the dataset.** Above all, this should check that the speck step never cuts real bone on thin, fractured or unusual vertebrae, and that the measured limits (3 mm necks, 150 mm³ specks, 50 mm³ thick-slice floaters, 2 cm³ separate bones) still hold.
+2. **Make the reference independent.** Correct `Final02` by hand in ITK-SNAP wherever I disagree with the pipeline (the C6/C5 spot first), and add scans that come with expert labels, such as TotalSegmentator and VerSe.
+3. **Bring back the name check as a separate tool** that flags suspicious names for a person to look at, without changing anything.
 
 ---
 
-## 8. Known limits 
-
-- **C1 on patient 6** is still in 2 pieces. One is 243 mm³, above the 150 mm³ limit, so I left it on purpose since it could be real bone.
-- **Unusual anatomy** (11 or 13 rib pairs, transitional vertebrae) can fool the name check. That's why it only reports. There are biological exceptions in this ribs idea , some people might not fall into the rib idea due to their unusual anatomy.
-- **Memory:** peaks around 8 GB on a long scan.
-- **Viewing tip:** when checking results in ITK-SNAP, especially on thick-slice scans, turn **3D Gaussian smoothing off**. It can make thin, real bone (like spinous tips) look like loose specks.
-
----
-
-## 9. Scoring system: measuring instead of eyeballing
-
-I made an **ideal mask** (of my final answer ( iam currently doing ideal segmentation by hand, but for now my final answer is treated as right) for patients 6 and 31) that I treat as the "right answer". I then built a scoring script, `direct_inference/score_vertebrae.py`, that compares **any** prediction folder against it, vertebra by vertebra.
+## 10. Running it
 
 ```bash
-python score_vertebrae.py --ideal ../Final02 \
-    --pred "raw AI=../AbdomenAtlasDemoPredict" --pred "Pro=../Refined_Pro" \
-    --pred "Hao=../Refined_Hao" --out_dir ../scores
+cd direct_inference
+python postprocessing_vertebrae_compact.py --pred_dir ../AbdomenAtlasDemoPredict \
+    --ct_root ../AbdomenAtlasDemo --out_dir ../Final --case BDMAP_00000031
+
+python score_vertebrae.py --ideal ../Final02 --pred "raw AI=../AbdomenAtlasDemoPredict" \
+    --pred "ShapeKit-Pro=../Refined_Pro" --out_dir ../scores
 ```
 
-### What it measures (per vertebra)
-| Metric | Meaning | Good value |
-|---|---|---|
-| **Dice** | how much the predicted vertebra overlaps the ideal one | 1.0 |
-| **HD95** | how far off the surface is, in mm (95th percentile, ignores a few outliers) | 0 mm |
-| **ASSD** | average surface distance, in mm | 0 mm |
-| **Naming** | does most of the vertebra carry the right label? | yes |
-| **Extra pieces** | loose bits compared with the ideal (specks / breaks) | 0 |
-
-Plus **spine Dice**: all vertebrae as one mask, so it only checks the outline and ignores names.
-
-### One overall score (0–100)
-**SCORE = 100 × (0.5 × mean Dice + 0.2 × naming + 0.2 × surface + 0.1 × clean)**
-
-- *surface* = 1 − HD95 / 10 mm, per vertebra (10 mm or worse gives 0);
-- *clean* = the share of vertebrae with no extra pieces.
-
-I added naming and cleanliness because **Dice alone misses them**. On my test masks, one added speck only moved Dice from 1.0 to 0.9998, and swapping two names is a disaster that Dice per label shows only indirectly.
-
-I sanity-checked it on synthetic masks:
-
-| Test | Score |
-|---|---|
-| identical | **100** |
-| shifted 2 mm | 91 |
-| one speck | 96.7 |
-| one vertebra missing | 66.7 |
-| two names swapped | 40 |
-
-### Results (patient 31)
-| Method | SCORE | mean Dice | worst vertebra | HD95 (mm) | naming | clean |
-|---|---|---|---|---|---|---|
-| raw AI | 63.9 | 0.761 | L1 0.15 | 10.7 | 0.79 | 0.08 |
-| AbdomenAtlasDemoRefined | 72.0 | 0.809 | T11 0.00 (missing) | 6.9 | 0.88 | 0.25 |
-| AbdomenAtlasDemoRefined1 | 72.0 | 0.876 | T7 0.69 | 8.5 | 1.00 | 0.04 |
-| Hao | 78.6 | 0.919 | T8 0.80 | 6.0 | 1.00 | 0.17 |
-| Pro | 92.1 | 0.990 | C7 0.97 | 0.4 | 1.00 | 0.33 |
-
-
-Patient 6: the raw AI scores **88.0** (mean Dice 0.946, but only 42 % of vertebrae clean).
-
-**What this shows:**
-- **The raw AI names T9–L1 one level off on patient 31.** L1 is labelled as T12, T12 as T11, and so on, which is why its L1 Dice is only 0.15. That's exactly the kind of error the rib/sacrum check is there to catch.
-- **Pro's shapes are already very close (Dice 0.99), but only 33 % of its vertebrae are clean.** The specks are what's left, and that's the part I fixed.
-- **Hao edits only L2–T5**, so everything else keeps the AI's mistakes.
-
-**Honest caveat:** My final answer is currently **identical to my pipeline's output** (`Final/`). So my own result scores 100 by definition, and that number proves nothing about my method. Right now the scores tell how close *other* methods get to mine. To make it a real benchmark, the next step is to **hand-correct `Final02`** in ITK-SNAP wherever I disagree with my pipeline (for example the C6/C5 spot, or the C1 piece). Every method, including mine, then gets scored against a truly independent answer. More cases would help too: AbdomenAtlas, or TotalSegmentator/VerSe, which come with expert vertebra labels.
+The pipeline writes `combined_labels.nii.gz` and one file per vertebra in `segmentations/`. Add `--no_specks` to skip step 3. A walk through the code is in `code_explainer.md`.
 
 ---
 
-## Credits
-- **SuPreM**: the pre-trained segmentation model that produces the initial labels.
-- **ShapeKit-Pro** (PART 1): written by **Abhijit Das**. [github.com/aj-das-research/jhu-bodymaps-warmup](https://github.com/aj-das-research/jhu-bodymaps-warmup)
-- **Hao's pipeline** ("stable cores + geodesic consensus", output in `Refined_Hao/`) and the body-finding ("shrinking into cores") idea: **Hao Yu**. Published as the `shapekit_hao` backend of [BodyMaps/ShapeKit](https://github.com/BodyMaps/ShapeKit) ([docs](https://github.com/BodyMaps/ShapeKit/blob/main/docs/VERTEBRAE_HAO.md), [pull request #16](https://github.com/BodyMaps/ShapeKit/pull/16)).
-- **ShapeKit** (the original toolkit): Liu et al., *ShapeKit*, Shape in Medical Imaging workshop 2025 (cited in the task brief).
-- **My work:** the first disc/drum approach (`find_discs.py`, `fix_vertebrae.py`), merging everything into one tested script, the speck removal (incl. thick slices), the rewritten and tested rib/sacrum name check, the analysis in this document, and the upcoming scoring system.
+## 11. CREDITS
+
+
+1. H. Yu. *Stable-core, two-scale geodesic correction of L2–T5* (the `shapekit_hao` backend of ShapeKit). [docs](https://github.com/BodyMaps/ShapeKit/blob/main/docs/VERTEBRAE_HAO.md), [pull request #16](https://github.com/BodyMaps/ShapeKit/pull/16)
+2. J. Liu, D. He, W. Li, N. Wang, A. L. Yuille, Z. Zhou. *ShapeKit.* International Workshop on Shape in Medical Imaging, pp. 44–58, Springer, 2025. Code: [github.com/BodyMaps/ShapeKit](https://github.com/BodyMaps/ShapeKit)
+3. A. Das. *ShapeKit-Pro: evidence-edited, anatomy-audited post-processing for vertebra segmentations.* [github.com/aj-das-research/jhu-bodymaps-warmup](https://github.com/aj-das-research/jhu-bodymaps-warmup)
+
