@@ -13,7 +13,7 @@
 | **What existed** | Two clean-up approaches: **ShapeKit-Pro** and the **Hao pipeline**. Each fixed some things and broke or missed others. |
 | **What I built** | **One script** (`direct_inference/postprocessing_vertebrae.py`) that runs Pro, polishes the result, **removes the specks Pro left behind**, and then **checks the vertebra names against the ribs and sacrum**. |
 | **Main fixes of mine** | 1. Specks that *looked* loose but were hidden-connected → removed. 2. Same thing on thick-slice scans. 3. A name checker that gave false alarms → rewritten and tested. 4. Four scripts merged into one, proven to give identical output. |
-| **Next** | I've made an **ideal (reference) mask**, and I'm now building a **scoring system** that rates any new prediction against it. |
+| **Scoring** | An **ideal mask** (`Final02`) plus a **scoring script** (Dice, surface distance, naming, specks → one 0–100 score) that rates any prediction against it. |
 
 ---
 
@@ -171,38 +171,40 @@ I also stress-tested it on four other outputs of the same patient (Pro, Hao and 
 
 ### 4.3 Thick-slice scans (patient 6)
 
-On patient 6 there was still **one magenta dot** left:
+On patient 6 I still saw **one magenta dot**:
 
 <p align="center"><img src="Images/doc_figures/thick_slice_speck_patient6.png" width="420"></p>
 
-The reason: patient 6's slices are **2.5 mm thick** (patient 31's are 0.7 mm). A 1–1.5 mm shrink **can't reach the next slice**, so a blob joined only through the slice above or below was never cut. That was an assumption in my own rule.
+Looking for the cause, I found a real gap in my speck rule. Patient 6's slices are **2.5 mm thick** (patient 31's are 0.7 mm), and a 1–1.5 mm shrink **can't reach the next slice**. So a blob joined only through the slice above or below was never cut. That was an assumption in my own rule.
 
 The obvious fix (always shrink up and down too) was **too aggressive**. It deleted 3 cm³, mostly real bone in the thin neck vertebrae, and created new loose pieces. So I made it narrower: **only on thick-slice scans**, delete pieces **≤ 50 mm³** that are joined through a single slice **and touch no other vertebra**.
 
-- The magenta dot (an 8-voxel bit of T12) is gone.
+- It removed 8 small floaters like that (e.g. an 8-voxel bit of T12).
 - Only 233 mm³ changed in total; every vertebra kept ≥ 99.8 % of its shape.
 - Patient 31 is **provably unchanged**: with thin slices this extra step never runs.
 
+**But the magenta dot was still there.** It turned out not to be one of those floaters at all:
+
 #### A "speck" that wasn't one: the viewer's smoothing
-After that fix, I still saw **one more magenta dot** on patient 6, sitting in a notch of the cyan vertebra (T12 = magenta, L1 = cyan):
+The dot sits in a notch of the cyan vertebra. In my colour table magenta = **T10** and cyan = **T11**:
 
 <table>
 <tr>
 <td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_on.png" height="300"><br><sub>ITK-SNAP with <b>3D Gaussian smoothing ON</b>: looks like a floating dot</sub></td>
-<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_off.png" height="300"><br><sub>Same spot, <b>smoothing OFF</b>: it's the tip of T12, attached</sub></td>
+<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_off.png" height="300"><br><sub>Same spot, <b>smoothing OFF</b>: it's a tip of T10, attached</sub></td>
 </tr>
 </table>
 
-This time the code wasn't wrong. When I checked the CT at that spot:
-- it's the **tip of T12's spinous process**, the bony point at the back of the vertebra. Spinous processes slope **down**, so T12's tip rests right on top of L1's spinous process;
-- the CT there is **300–460 HU**, which is solid bone, so it's real;
-- it is **still part of T12** (one connected piece), so the speck step correctly leaves it alone.
+This time the code wasn't wrong. When I checked the CT at the most likely spot (about voxel 255, 123, slice 212):
+- it's a **thin tip of T10's back part**. The back of a vertebra slopes **down**, so this tip rests right on T11;
+- the CT there is **about 440 HU**, which is solid bone, so it's real;
+- it is **still part of T10** (one connected piece), so the speck step correctly leaves it alone.
 
 <p align="center"><img src="Images/doc_figures/spinous_tip_ct_slices.png" width="900"></p>
 
-So why did it look loose? On patient 6's 2.5 mm slices the tip is only **1–2 slices thick**. ITK-SNAP's **3D Gaussian smoothing** blurs the mask before drawing the surface, and a link that thin gets smoothed away, so the tip shows up as a separate blob. With smoothing turned **off**, it's clearly joined to T12.
+So why did it look loose? On patient 6's 2.5 mm slices the tip is only **1–2 slices thick**. ITK-SNAP's **3D Gaussian smoothing** blurs the mask before drawing the surface, and a link that thin gets smoothed away, so the tip shows up as a separate blob. With smoothing turned **off**, it's clearly joined to T10.
 
-**Lesson:** not every dot in a 3D render is an error. Before "fixing" one, check the CT and the raw (unsmoothed) mask. Recolouring this tip as L1 would actually make the label **wrong**: a spinous process belongs to the vertebra it starts from, and keeping it that way is one of the things Pro was built to do.
+**Lesson:** not every dot in a 3D render is an error. Before "fixing" one, check the CT and the raw (unsmoothed) mask. Recolouring this tip as T11 would actually make the label **wrong**: the back parts of a vertebra belong to the vertebra they start from, and keeping it that way is one of the things Pro was built to do.
 
 ### 4.4 The rib and sacrum name check (PART 4b)
 
@@ -331,15 +333,63 @@ Switches: `--no_specks` (old behaviour), `--no_hao_check` (skip the second pipel
 
 ---
 
-## 9. What's next: ideal mask + scoring system
+## 9. Scoring system: measuring instead of eyeballing
 
-I've made an **ideal mask**: a carefully checked reference segmentation that I treat as the "right answer". I'm now building a **scoring system** that takes **any new prediction** (raw AI, Pro, Hao, mine or a future version) and scores it against that ideal mask. That way, improvements can be **measured instead of eyeballed** in ITK-SNAP.
+I made an **ideal mask** (`Final02/`, for patients 6 and 31) that I treat as the "right answer". I then built a scoring script, `direct_inference/score_vertebrae.py`, that compares **any** prediction folder against it, vertebra by vertebra.
 
-Things I'm planning to score:
-- **overlap per vertebra** (Dice);
-- **how far the surfaces are off** (surface distance);
-- **naming**: is each vertebra called the right name;
-- **specks / extra pieces** per vertebra.
+```bash
+python score_vertebrae.py --ideal ../Final02 \
+    --pred "raw AI=../AbdomenAtlasDemoPredict" --pred "Pro=../Refined_Pro" \
+    --pred "Hao=../Refined_Hao" --out_dir ../scores
+```
+
+### What it measures (per vertebra)
+| Metric | Meaning | Good value |
+|---|---|---|
+| **Dice** | how much the predicted vertebra overlaps the ideal one | 1.0 |
+| **HD95** | how far off the surface is, in mm (95th percentile, ignores a few outliers) | 0 mm |
+| **ASSD** | average surface distance, in mm | 0 mm |
+| **Naming** | does most of the vertebra carry the right label? | yes |
+| **Extra pieces** | loose bits compared with the ideal (specks / breaks) | 0 |
+
+Plus **spine Dice**: all vertebrae as one mask, so it only checks the outline and ignores names.
+
+### One overall score (0–100)
+**SCORE = 100 × (0.5 × mean Dice + 0.2 × naming + 0.2 × surface + 0.1 × clean)**
+
+- *surface* = 1 − HD95 / 10 mm, per vertebra (10 mm or worse gives 0);
+- *clean* = the share of vertebrae with no extra pieces.
+
+I added naming and cleanliness because **Dice alone misses them**. On my test masks, one added speck only moved Dice from 1.0 to 0.9998, and swapping two names is a disaster that Dice per label shows only indirectly.
+
+I sanity-checked it on synthetic masks:
+
+| Test | Score |
+|---|---|
+| identical | **100** |
+| shifted 2 mm | 91 |
+| one speck | 96.7 |
+| one vertebra missing | 66.7 |
+| two names swapped | 40 |
+
+### Results (patient 31)
+| Method | SCORE | mean Dice | worst vertebra | HD95 (mm) | naming | clean |
+|---|---|---|---|---|---|---|
+| raw AI | 63.9 | 0.761 | L1 0.15 | 10.7 | 0.79 | 0.08 |
+| AbdomenAtlasDemoRefined | 72.0 | 0.809 | T11 0.00 (missing) | 6.9 | 0.88 | 0.25 |
+| AbdomenAtlasDemoRefined1 | 72.0 | 0.876 | T7 0.69 | 8.5 | 1.00 | 0.04 |
+| Hao | 78.6 | 0.919 | T8 0.80 | 6.0 | 1.00 | 0.17 |
+| Pro | 92.1 | 0.990 | C7 0.97 | 0.4 | 1.00 | 0.33 |
+| Final1 | 92.7 | 0.996 | C7 0.98 | 0.03 | 1.00 | 0.29 |
+
+Patient 6: the raw AI scores **88.0** (mean Dice 0.946, but only 42 % of vertebrae clean).
+
+**What this shows:**
+- **The raw AI names T9–L1 one level off on patient 31.** L1 is labelled as T12, T12 as T11, and so on, which is why its L1 Dice is only 0.15. That's exactly the kind of error the rib/sacrum check is there to catch.
+- **Pro's shapes are already very close (Dice 0.99), but only 33 % of its vertebrae are clean.** The specks are what's left, and that's the part I fixed.
+- **Hao edits only L2–T5**, so everything else keeps the AI's mistakes.
+
+**Honest caveat:** `Final02` is currently **identical to my pipeline's output** (`Final/`). So my own result scores 100 by definition, and that number proves nothing about my method. Right now the scores tell how close *other* methods get to mine. To make it a real benchmark, the next step is to **hand-correct `Final02`** in ITK-SNAP wherever I disagree with my pipeline (for example the C6/C5 spot, or the C1 piece). Every method, including mine, then gets scored against a truly independent answer. More cases would help too: AbdomenAtlas, or TotalSegmentator/VerSe, which come with expert vertebra labels.
 
 ---
 
