@@ -29,9 +29,12 @@ SuPreM is a pre-trained 3D segmentation model. Given a CT scan, its vertebra mod
 
 | | **ShapeKit-Pro** | **Hao pipeline** |
 |---|---|---|
-| Who | Abhijit Das (credited in the code) | Built around Hao Yu's idea of finding vertebral bodies by "shrinking" the mask |
-| Idea | Redraw borders using the CT itself: discs show up as **dark dips** between vertebrae; every step undoes itself if it doesn't improve things | Find the vertebral **bodies** without trusting the AI's colours, count them using the **ribs and sacrum**, then re-cut and rename |
-| Speed (patient 31) | ~11 min | ~1 min |
+| Who | Abhijit Das (credited in the code) | Hao Yu |
+| Idea | Redraw borders using the CT itself: discs show up as **dark dips** between vertebrae; every step undoes itself if it doesn't improve things | Find the vertebral **bodies** as stable "cores" (shrink the mask until the bodies separate), without trusting the AI's colours, then let each core **grow through bone** to decide the borders ("stable cores + geodesic consensus") |
+| What it edits | the whole spine | **only L2–T5**; every other vertebra is locked exactly as the AI drew it |
+| Speed (patient 31) | ~11 min | ~6 min |
+| Output | `Refined_Pro/` | `Refined_Hao/` (with its own `report.json`, `qa/` and `run_manifest.json`) |
+| Code | [aj-das-research/jhu-bodymaps-warmup](https://github.com/aj-das-research/jhu-bodymaps-warmup) | the `shapekit_hao` backend in [BodyMaps/ShapeKit](https://github.com/BodyMaps/ShapeKit): [engine](https://github.com/BodyMaps/ShapeKit/blob/main/utils/vertebrae_hao_engine.py), [docs](https://github.com/BodyMaps/ShapeKit/blob/main/docs/VERTEBRAE_HAO.md), [pull request #16](https://github.com/BodyMaps/ShapeKit/pull/16) |
 
 ---
 
@@ -61,7 +64,7 @@ On **patient 6** (thick 2.5 mm slices) it broke. In the middle of the thoracic s
 
 ### What I learned (and why I moved on)
 - **Thick slices hide discs.** This turned out to be the theme of the whole project. The same problem came back later in the specks (4.3) and in the old name checker (4.4).
-- **Slice-by-slice is too simple for a curved spine.** Where the spine bends, one flat slice cuts through two vertebrae at once and the dip gets blurred. Pro and Hao measure brightness on discs **perpendicular to the spine** instead, which is the grown-up version of the same idea.
+- **Slice-by-slice is too simple for a curved spine.** Where the spine bends, one flat slice cuts through two vertebrae at once and the dip gets blurred. Pro measures brightness on discs **perpendicular to the spine** instead, which is the grown-up version of the same idea.
 - **Drums only cover the bodies.** The arches and spinous processes need their own handling, and Pro already does that properly (regrowing them from the pedicles).
 
 So instead of rebuilding all of that myself, I took **Pro** (which already had the better version of my disc idea) as the base, and focused on what it still got wrong.
@@ -81,11 +84,11 @@ But from the side and back, **parts of the arches and spinous processes are pain
 <table>
 <tr>
 <td align="center"><img src="Images/Haos_BACK_1_BAD.png" height="460"><br><sub>Lower spine: wrong-coloured patches on the arches (e.g. cyan inside purple, orange on blue)</sub></td>
-<td align="center"><img src="Images/Haos_Back_2_BAD.png" height="460"><br><sub>Upper spine: spinous tips carrying the wrong colour (e.g. red tip on the cream vertebra)</sub></td>
+<td align="center"><img src="Images/Haos_Back_2_BAD.png" height="460"><br><sub>Upper spine: spinous tips carrying the wrong colour (e.g. red tip on the cream vertebra). This is mostly above T5, where Hao doesn't edit, so these are the AI's own mistakes left in place.</sub></td>
 </tr>
 </table>
 
-Why: Hao's method mainly fixes **bodies**. The back of the spine is harder, because the spinous processes **droop down over the vertebra below**, so they get handed to the wrong owner. On patient 31, Hao's own audit went from 15 problems to 9 (not 0), and it changed 26% of the spine.
+Why: Hao's method is built around the **bodies** (the cores), and its own report says so: *"No height-based posterior seeds. Unreachable/ambiguous regions retain v2."* In other words, wherever it can't safely reach the back of the spine, it **keeps the AI's original colours**, mistakes included. That part is hard anyway, because the spinous processes **droop down over the vertebra below**, so they easily get handed to the wrong owner. On top of that, Hao only edits **L2–T5**, so nothing above or below that range is touched. On patient 31 it changed 360,603 voxels, and every body core ended up with a single colour (purity 1.0).
 
 ### 3.2 ShapeKit-Pro: the shapes are good, but specks are left
 
@@ -121,7 +124,7 @@ flowchart LR
     P2 --> P3[PART 3<br>specks<br>my fix]
     P3 --> OUT[final labels]
     P3 --> P4[PART 4<br>checks<br>report only]
-    A --> H[Hao pipeline] --> P4
+    A --> H[second-opinion<br>pipeline] --> P4
     P4 --> R[report.json<br>review.nii.gz<br>landmarks.nii.gz]
 ```
 
@@ -180,6 +183,27 @@ The obvious fix (always shrink up and down too) was **too aggressive**. It delet
 - Only 233 mm³ changed in total; every vertebra kept ≥ 99.8 % of its shape.
 - Patient 31 is **provably unchanged**: with thin slices this extra step never runs.
 
+#### A "speck" that wasn't one: the viewer's smoothing
+After that fix, I still saw **one more magenta dot** on patient 6, sitting in a notch of the cyan vertebra (T12 = magenta, L1 = cyan):
+
+<table>
+<tr>
+<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_on.png" height="300"><br><sub>ITK-SNAP with <b>3D Gaussian smoothing ON</b>: looks like a floating dot</sub></td>
+<td align="center"><img src="Images/doc_figures/spinous_tip_smoothing_off.png" height="300"><br><sub>Same spot, <b>smoothing OFF</b>: it's the tip of T12, attached</sub></td>
+</tr>
+</table>
+
+This time the code wasn't wrong. When I checked the CT at that spot:
+- it's the **tip of T12's spinous process**, the bony point at the back of the vertebra. Spinous processes slope **down**, so T12's tip rests right on top of L1's spinous process;
+- the CT there is **300–460 HU**, which is solid bone, so it's real;
+- it is **still part of T12** (one connected piece), so the speck step correctly leaves it alone.
+
+<p align="center"><img src="Images/doc_figures/spinous_tip_ct_slices.png" width="900"></p>
+
+So why did it look loose? On patient 6's 2.5 mm slices the tip is only **1–2 slices thick**. ITK-SNAP's **3D Gaussian smoothing** blurs the mask before drawing the surface, and a link that thin gets smoothed away, so the tip shows up as a separate blob. With smoothing turned **off**, it's clearly joined to T12.
+
+**Lesson:** not every dot in a 3D render is an error. Before "fixing" one, check the CT and the raw (unsmoothed) mask. Recolouring this tip as L1 would actually make the label **wrong**: a spinous process belongs to the vertebra it starts from, and keeping it that way is one of the things Pro was built to do.
+
 ### 4.4 The rib and sacrum name check (PART 4b)
 
 #### What it's for
@@ -232,7 +256,8 @@ I fed it the real labels and two kinds of deliberately broken labels, on both pa
 | Arches / spinous processes (back) | ❌ neighbour's colour | ✅ | ✅ |
 | Loose specks | — | ❌ hidden-connected blobs | ✅ removed (76 → 0) |
 | Thick-slice scans | — | ❌ | ✅ |
-| Name check (ribs/sacrum) | used to edit | — | ✅ fixed, tested, report only |
+| Range edited | L2–T5 only | whole spine | whole spine |
+| Name check (ribs/sacrum) | — | — | ✅ fixed, tested, report only |
 | One command | — | — | ✅ |
 
 | | Patient 31 (0.7 mm slices) | Patient 6 (2.5 mm slices) |
@@ -242,7 +267,7 @@ I fed it the real labels and two kinds of deliberately broken labels, on both pa
 | Specks fixed | 30 recoloured, 215 deleted | 70 recoloured, 90 deleted |
 | Vertebrae in > 1 piece | 18 → **0** | 13 → **1** (C1, see limits) |
 | Name check | CONFIRMED | CONFIRMED |
-| Pro vs Hao (bodies L2–T5) | agree on 5, differ on T11–T7 | agree on all 10 |
+| Pro vs second-opinion pipeline (bodies L2–T5) | agree on 5, differ on T11–T7 | agree on all 10 |
 
 ---
 
@@ -268,7 +293,7 @@ Everything is in **`direct_inference/postprocessing_vertebrae.py`**. One rule ru
 | **1. ShapeKit-Pro** | **Sort loose bits:** tiny → delete; not bone → delete; bone near its vertebra → reconnect. **Islands:** a piece wrapped by another vertebra joins it. **Redraw suspicious borders at the discs:** walk up the spine, every dark dip is a disc; vertebrae "grow" through bone from their middles and meet in the gaps. **Arches:** regrown from the pedicles, the two bony bridges to their own body. **Straighten flat cuts** onto the darkest line. **Put set-aside bone back** with its right owner. **Check colours from 3 views**: recolour only if all agree. **Fix mixed pieces.** **Spinous processes:** colour may only flow downward. **Smooth** edges, fill holes. |
 | **2. Cleanup** | Stray pieces sitting on another vertebra take its colour. Fill holes and small dents, but only where the CT shows bone (so the spinal canal is never filled). No vertebra may grow by more than 3 %. |
 | **3. Specks (mine)** | Shrink each vertebra 1–1.5 mm. Anything that comes loose (plus corner-only joins) and is < 150 mm³ goes to the vertebra it sits on, or is deleted. On thick-slice scans, also small floaters joined through one slice. |
-| **4a. Hao check** | Runs the Hao pipeline on the same scan and compares the bodies L2–T5 with ours. Disagreements are marked in `review.nii.gz` (value 1). |
+| **4a. Second opinion** | Runs a second, independent repair pipeline on the same scan and compares its bodies L2–T5 with ours. It uses Hao's "cores" idea plus rib/sacrum naming and a disc re-cut, but it is **not** Hao's original program; the code calls it `run_hao` / `--no_hao_check` for historical reasons. Disagreements are marked in `review.nii.gz` (value 1). |
 | **4b. Name check (mine, rewritten)** | Sacrum → L5, lowest ribs → T12, (highest ribs → T1). Verdict CONFIRMED / WRONG_NAMES / NEEDS_BOUNDARY_FIX / UNSURE. Wrong names are marked in `review.nii.gz` (value 2). |
 
 ### Output files (`Final/<patient>/`)
@@ -277,7 +302,7 @@ Everything is in **`direct_inference/postprocessing_vertebrae.py`**. One rule ru
 |---|---|
 | `combined_labels.nii.gz` | the cleaned labels, all vertebrae in one file |
 | `segmentations/vertebrae_*.nii.gz` | the same, one file per vertebra |
-| `review.nii.gz` | places to look at (1 = Pro and Hao disagree, 2 = name doesn't match the anatomy) |
+| `review.nii.gz` | places to look at (1 = Pro and the second-opinion pipeline disagree, 2 = name doesn't match the anatomy) |
 | `landmarks.nii.gz` | the ribs (coloured by their vertebra) and the sacrum (25) the checker found |
 | `report.json` | every decision and number |
 | `pro_qa.json` | ShapeKit-Pro's detailed log |
@@ -302,6 +327,7 @@ Switches: `--no_specks` (old behaviour), `--no_hao_check` (skip the second pipel
 - **Needs real CT values** (Hounsfield units). A converted 0–255 image won't work.
 - **Needs `cc3d`** (`pip install connected-components-3d`). Pro relies on it, and I tested that scipy can't replace it without changing Pro's results.
 - **Memory:** peaks around 8 GB on a long scan.
+- **Viewing tip:** when checking results in ITK-SNAP, especially on thick-slice scans, turn **3D Gaussian smoothing off**. It can make thin, real bone (like spinous tips) look like loose specks.
 
 ---
 
@@ -319,6 +345,7 @@ Things I'm planning to score:
 
 ## Credits
 - **SuPreM**: the pre-trained segmentation model that produces the initial labels.
-- **ShapeKit-Pro** (PART 1): written by **Abhijit Das**.
-- **Hao pipeline** and the body-finding ("shrinking into cores") idea: **Hao Yu**.
+- **ShapeKit-Pro** (PART 1): written by **Abhijit Das**. [github.com/aj-das-research/jhu-bodymaps-warmup](https://github.com/aj-das-research/jhu-bodymaps-warmup)
+- **Hao's pipeline** ("stable cores + geodesic consensus", output in `Refined_Hao/`) and the body-finding ("shrinking into cores") idea: **Hao Yu**. Published as the `shapekit_hao` backend of [BodyMaps/ShapeKit](https://github.com/BodyMaps/ShapeKit) ([docs](https://github.com/BodyMaps/ShapeKit/blob/main/docs/VERTEBRAE_HAO.md), [pull request #16](https://github.com/BodyMaps/ShapeKit/pull/16)).
+- **ShapeKit** (the original toolkit): Liu et al., *ShapeKit*, Shape in Medical Imaging workshop 2025 (cited in the task brief).
 - **My work:** the first disc/drum approach (`find_discs.py`, `fix_vertebrae.py`), merging everything into one tested script, the speck removal (incl. thick slices), the rewritten and tested rib/sacrum name check, the analysis in this document, and the upcoming scoring system.
