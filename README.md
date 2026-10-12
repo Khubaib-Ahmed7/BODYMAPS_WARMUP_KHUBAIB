@@ -1,8 +1,6 @@
 # Cleaning up AI vertebra labels on CT scans
 
-SuPreM is good at finding the spine in a CT scan, but its vertebra labels are not clean enough to use as they are. Vertebrae come out split between two colours, small blobs float around them, the back of the spine is often painted with the wrong label, and now and then a piece of a completely different bone is labelled as a vertebra.
-
-This document describes the post-processing I built to fix that. It explains what the AI gets wrong, what two existing approaches do about it and where they fall short, how the pipeline works and why each part works, what I tried that didn't work, how I measure the results, and what still needs to be done.
+This document describes the post-processing I built. It explains what the AI gets wrong, what the existing approaches do about it and where they fall short, how the pipeline works and why each part works, what I tried that didn't work, how I measure the results, and what still needs to be done.
 
 <p align="center"><img src="Images/doc_figures/raw_vs_final_patient31.png" width="760"></p>
 <p align="center"><sub><b>Patient 31, lower spine.</b> Left: the AI's labels. Several vertebrae carry two colours, L1 has almost disappeared, and there are even C6/C7 labels in the middle of the thoracic spine. Right: the same scan after The fix.</sub></p>
