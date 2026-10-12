@@ -123,7 +123,7 @@ CFG = {
 }
 
 
-# =================================================================== I/O ====
+# I/O 
 def load_case(case_dir: Path, ct_root: Path):
     """Vertebra labels come from SuPreM's vertebrae output: either
     segmentations/vertebrae_<NAME>.nii.gz (preferred, unambiguous by name) or a
@@ -204,7 +204,7 @@ def components(mask):
     return lab, sizes
 
 
-# ============================================================ 1 CLEANUP ====
+# 1 CLEANUP 
 def stage1_cleanup(seg, ct, zooms, rep):
     """Every non-main piece of every label is judged:
        touching another vertebra (most of its labelled border) -> takes that colour;
@@ -249,7 +249,7 @@ def stage1_cleanup(seg, ct, zooms, rep):
     return out
 
 
-# =========================================================== 2 GEOMETRY ====
+# 2GEOMETRY 
 class Geo:
     pass
 
@@ -352,7 +352,7 @@ def body_region(seg, g, z0, z1):
     return (seg[:, :, z0:z1 + 1] > 0) & (g.post * (jj - back) * g.zooms[1] <= CFG["back_margin_mm"])
 
 
-# ================================================================ discs ====
+# discs 
 def find_dips(g):
     sig = -g.rho
     peaks, props = signal.find_peaks(sig, prominence=CFG["disc_min_hu"] * 0.4,
@@ -370,7 +370,7 @@ def disc_between(dips, za, zb):
     return best if best["prom"] >= CFG["disc_min_hu"] else None
 
 
-# ================================================================ 3 CORES ===
+# 3 CORES 
 def _cores_at(depth, r, seg, ct, g, vox, off):
     """Cores at shrink radius r inside the tube box; `off` = box corner, so
     centres come back in crop coordinates."""
@@ -452,7 +452,7 @@ def find_cores(seg, ct, g):
     return cores, r
 
 
-# ============================================================ 4 LANDMARKS ===
+# 4 LANDMARKS 
 def _core_of_height(h, cores, g):
     """Index of the body whose slab (midpoints to its neighbours) holds height h."""
     hs = [float(up(c["z"], g)) for c in cores]
@@ -572,7 +572,7 @@ def find_sacrum(seg, ct, g, cores):
             "cm3": round(vol, 1), "gap_mm": round(float(gap), 1)}, mask
 
 
-# =============================================================== 5 NAMING ===
+# 5 NAMING 
 def name_bodies(cores, ribs, sacrum, g):
     """Count the bodies from the landmarks. Bodies are split into runs wherever a
     body seems to be missing (gap > missing_body_ratio x local spacing); each run is
@@ -623,7 +623,7 @@ def name_bodies(cores, ribs, sacrum, g):
     return names, anchors, decisions
 
 
-# =========================================== 6 RENAME + RE-CUT (bodies) ===
+# 6 RENAME + RE-CUT (bodies) 
 def border_meter(seg, g, dips):
     """For consecutive labels along the spine: border vs clear disc (mm), and body
     purity. Used by gates and the audit."""
@@ -835,7 +835,7 @@ def stage6_rename_recut(seg, ct, g, cores, names, dips, rep):
     return out
 
 
-# ========================================================== 7 SPINOUS ====
+#  7 SPINOUS 
 def _corridor(seg, g, z):
     """Midline strip behind the spinal canal on slice z (spinous processes)."""
     dx, dy = g.zooms[0], g.zooms[1]
@@ -928,7 +928,7 @@ def stage7_spinous(seg, ct, g, rep):
     return out if ok else seg
 
 
-# ============================================================ 8 AUDIT ====
+# 8 AUDIT 
 def audit(seg, g, dips, ct):
     vox = float(np.prod(g.zooms))
     rows = {}
@@ -969,7 +969,7 @@ def audit(seg, g, dips, ct):
             "bad": len(frag) + 3 * len(missing) + order + len(size_flags) + len(off)}
 
 
-# ============================================================== DRIVER ====
+#  DRIVER 
 def refine(seg, ct, affine, rep):
     """All stages on one (cropped) case. Returns the refined labels + landmark mask."""
     zooms = tuple(float(z) for z in nib.affines.voxel_sizes(affine))
@@ -1311,7 +1311,7 @@ def pro_audit(seg, affine, vox_mm3):
     return rows, summary
 
 
-# ---------------------------------------------------------------- stage 1 --
+# stage 1 
 def stage1_triage(seg, ct, zooms, vox_mm3, records):
     """Takes: seg (raw uint8 labels), ct (HU volume, same grid), zooms (mm),
         vox_mm3, records (QA list, appended per decision).
@@ -1402,7 +1402,7 @@ def _bridge(seg, bone, main, comp, lid, zooms, neck_mm=None):
     return corridor
 
 
-# --------------------------------------------------------------- stage 2a --
+# stage 2a 
 def stage2a_islands(seg, vox_mm3, records):
     """Takes: seg, vox_mm3, records (QA list).
     Does: island guard: a component enclosed at least 80 percent by one other
@@ -1445,7 +1445,7 @@ def stage2a_islands(seg, vox_mm3, records):
     return out
 
 
-# --------------------------------------------------------------- stage 2b --
+#  stage 2b 
 def find_suspects(seg, raw, affine, vox_mm3):
     """Takes: seg, raw (original prediction, for the unclaimed pool), affine,
         vox_mm3.
@@ -1804,7 +1804,7 @@ def arbitrate_band(seg, raw, ct, band, neighbors, cxs, cys, rho_s, zooms,
     cuts_z = [int(lo_cut)] + [int(f) for f in found] + [int(hi_cut)]
     rec["disc_cuts_z"] = cuts_z
 
-    # ---- arc-length field ----------------------------------------------
+    # arc-length field 
     zmm = np.asarray(zooms, dtype=np.float64)
     nzc = seg.shape[2]
     okc = ~np.isnan(cxs)
@@ -1842,7 +1842,7 @@ def arbitrate_band(seg, raw, ct, band, neighbors, cxs, cys, rho_s, zooms,
     assign = dict(zip(ids_by_z, seg_ranges))
     s_lo_all, s_hi_all = s_cuts[0], s_cuts[-1]
 
-    # ---- seeds: body core + agreement extension ------------------------
+    # seeds: body core + agreement extension 
     markers = np.zeros(seg_s.shape, dtype=np.int32)
     r2 = P["seed_radius_mm"] ** 2
     margin = P["seed_margin_mm"]
@@ -2265,7 +2265,7 @@ def stage2b_arbitrate(seg, raw, ct, affine, zooms, vox_mm3, qa):
     return out
 
 
-# --------------------------------------------------------------- stage 2c --
+#  stage 2c 
 def _adjacent_interfaces(seg):
     """One sweep over 3 axes -> {(a,b): Nx3 voxel points}, a<b.
 
@@ -2448,7 +2448,7 @@ def _polish_gate(rec, sub, cand, a, b, zooms, tag, p0):
     return bool(ok)
 
 
-# --------------------------------------------------------------- stage 2e --
+# stage 2e 
 def _centerline_xy(seg):
     """Takes: seg.
     Does: per-slice centroid of all labeled voxels, interpolated across empty
@@ -2680,7 +2680,7 @@ def stage2e_multiview_recolor(seg, ct, affine, zooms, vox_mm3, qa):
     return out
 
 
-# --------------------------------------------------------------- stage 2f --
+# stage 2f 
 def _masscut_mm2(seg, edtb, vox_mm3, thresh=2.5):
     """Area of label-label boundary crossing bone thicker than thresh -
     the violation meter for the core-integrity invariant.
@@ -2945,7 +2945,7 @@ def stage2f_skeleton_relabel(seg, ct, affine, zooms, vox_mm3, qa):
     return out_full
 
 
-# --------------------------------------------------------------- stage 2d --
+# stage 2d 
 def stage2d_reclaim_pool(seg, raw, ct, zooms, vox_mm3, qa):
     """Envelope rule: the raw prediction is the outer boundary - real BONE
     inside it gets its CLASS fixed, it is never deleted. Runs last, so it
@@ -3126,7 +3126,7 @@ def pro_absorb_orphans(seg, vox_mm3, max_mm3=1200.0, delete_below=100.0):
     return out
 
 
-# ---------------------------------------------------------------- stage 3 --
+# stage 3 
 def stage3_smooth(seg, ct, zooms, vox_mm3, qa):
     """Takes: seg, ct, zooms, vox_mm3, qa (records under 'smooth').
     Does: regularization: interface majority vote, orphan absorption, enclosed-
@@ -3325,7 +3325,7 @@ def check_array(seg, ct, affine):
                                 "not 12 - the first rib (or another) was not found, so the T1 "
                                 "landmark is not used")
 
-    # --- count: runs split where a vertebra seems missing; each run named by its anchors
+    # count: runs split where a vertebra seems missing; each run named by its anchors
     hs = np.array([float(up(b["z"], g)) for b in bodies])
     gaps = np.diff(hs)
     runs, cur = [], [0]
@@ -3379,7 +3379,7 @@ def check_array(seg, ct, affine):
     if len(cores) > len(on_body):
         rep["notes"].append(f"{len(cores) - len(on_body)} core(s) on a vertebral arch, not a body - ignored")
 
-    # --- table + verdict
+    # table + verdict
     table = []
     for i, b in enumerate(bodies):
         table.append({"body": i, "colour_now": NAMES[ai[i]],
@@ -3637,7 +3637,7 @@ def cleanup(seg, ct, zooms, rep):
     return s2
 
 
-# =============================================================== checks ===
+# checks 
 def hao_agreement(seg, hao, ct, affine, rep):
     """Compare Pro's and Hao's BODIES for L2..T5. Returns review mask (1 = disagree)."""
     zooms = tuple(float(z) for z in nib.affines.voxel_sizes(affine))
@@ -3673,7 +3673,7 @@ def anatomy_check(seg, ct, affine, rep):
     return review, lm
 
 
-# ================================================================ specks ===
+# specks 
 def _neck_parts(m, shrink, zooms):
     """Shrink the mask by the structure `shrink` (a ball of r mm: necks thinner than
     ~2 r come apart). Every voxel goes to its nearest core, so a part comes back at
@@ -3771,7 +3771,7 @@ def remove_specks(seg, zooms, rep):
     return out
 
 
-# ================================================================ driver ===
+# driver 
 def _spine_crop(seg_full, affine):
     """Box around the spine (+ crop_margin_mm) and the affine of that box."""
     zooms = nib.affines.voxel_sizes(affine)
