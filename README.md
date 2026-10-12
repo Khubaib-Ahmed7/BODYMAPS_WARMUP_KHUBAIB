@@ -2,17 +2,17 @@
 
 SuPreM is good at finding the spine in a CT scan, but its vertebra labels are not clean enough to use as they are. Vertebrae come out split between two colours, small blobs float around them, the back of the spine is often painted with the wrong label, and now and then a piece of a completely different bone is labelled as a vertebra.
 
-This document describes the post-processing I built to fix that. It explains what the AI gets wrong, what two existing approaches do about it and where they fall short, how my pipeline works and why each part works, what I tried that didn't work, how I measure the results, and what still needs to be done.
+This document describes the post-processing I built to fix that. It explains what the AI gets wrong, what two existing approaches do about it and where they fall short, how the pipeline works and why each part works, what I tried that didn't work, how I measure the results, and what still needs to be done.
 
 <p align="center"><img src="Images/doc_figures/raw_vs_final_patient31.png" width="760"></p>
-<p align="center"><sub><b>Patient 31, lower spine.</b> Left: the AI's labels. Several vertebrae carry two colours, L1 has almost disappeared, and there are even C6/C7 labels in the middle of the thoracic spine. Right: the same scan after my pipeline.</sub></p>
+<p align="center"><sub><b>Patient 31, lower spine.</b> Left: the AI's labels. Several vertebrae carry two colours, L1 has almost disappeared, and there are even C6/C7 labels in the middle of the thoracic spine. Right: the same scan after The fix.</sub></p>
 
 ---
 
 ## Contents
 1. [The problem](#1-the-problem)
 2. [Two existing approaches](#2-two-existing-approaches)
-3. [My pipeline](#3-my-pipeline)
+3. [The pipeline](#3-The-pipeline)
 4. [Things that look wrong but aren't](#4-things-that-look-wrong-but-arent)
 5. [What I tried that didn't work](#5-what-i-tried-that-didnt-work)
 6. [Measuring the result: a scoring system](#6-measuring-the-result-a-scoring-system)
@@ -84,7 +84,7 @@ What it leaves behind are **specks**:
 </tr>
 </table>
 
-The strange part is that the code *has* rules for removing loose pieces, and they never fired on these blobs. The reason took me a while to find, and it is the starting point of my own work (section 3.3).
+The strange part is that the code *has* rules for removing loose pieces, and they never fired on these blobs. The reason took me a while to find.
 
 ---
 
@@ -273,7 +273,7 @@ The table shows three things:
 - **Hao's method fixes the bodies but stops short.** Its scores are held back by the stretches and back parts it doesn't touch.
 - **ShapeKit-Pro's shapes are already very close (Dice 0.99), but only a third of its vertebrae are clean.** The rest is specks, which is exactly what step 3 removes.
 
-What my pipeline changes, per patient:
+What The pipeline changes, per patient:
 
 | | Patient 31 (0.7 mm slices) | Patient 6 (2.5 mm slices) |
 |---|---|---|
@@ -289,7 +289,7 @@ What my pipeline changes, per patient:
 </tr>
 </table>
 
-**A caveat on the reference.** The reference mask currently *is* my pipeline's output, so my own result scores 100 by definition, and that number proves nothing. For now the scores only show how close other methods get to mine. Section 9 describes how to turn this into an independent benchmark.
+**A caveat on the reference.** The reference mask currently *is* The pipeline's output, so the own result scores 100 by definition, and that number proves nothing. For now the scores only show how close other methods get to mine. Section 9 describes how to turn this into an independent benchmark.
 
 ---
 
